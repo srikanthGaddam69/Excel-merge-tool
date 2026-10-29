@@ -1,0 +1,15 @@
+{
+  "name": "excel-merge-tool",
+  "version": "2.1.0",
+  "description": "Offline, single-file browser tool that merges data from one Excel workbook into another by a key column while preserving the original formatting.",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "build": "python3 build.py",
+    "test": "node tests/run-tests.js"
+  },
+  "devDependencies": {
+    "@xmldom/xmldom": "^0.8.10",
+    "jszip": "^3.10.1"
+  }
+}

@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Excel Merge Tool</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="container">
+
+  <header class="app-header">
+    <h1>Excel Merge Tool</h1>
+    <p>Match rows between two workbooks by a key column, then replace or append values cell by cell.
+       Your original file's formatting stays exactly as it was. Everything runs offline in this browser — no data leaves your computer.</p>
+  </header>
+
+  <!-- STEP 1 -->
+  <section class="step" id="step1">
+    <div class="step-header"><div class="badge" id="b1">1</div><h2 class="step-title">Load your files</h2></div>
+    <div class="col-grid">
+      <div>
+        <span class="lbl">Original workbook (the one to update)</span>
+        <div class="upload-zone" id="origZone" tabindex="0" role="button" aria-label="Upload original workbook">
+          <input type="file" id="origInput" accept=".xlsx,.xlsm,.xls,.csv">
+          <div class="icon">📄</div>
+          <div class="label">Click or drop the original file</div>
+          <div class="hint">.xlsx / .xlsm (formatting kept) · .xls / .csv</div>
+        </div>
+        <div id="origLoaded" class="file-loaded"><div class="dot-ok"></div><span id="origName"></span></div>
+      </div>
+      <div>
+        <span class="lbl">Shared workbook (the data source)</span>
+        <div class="upload-zone" id="sharedZone" tabindex="0" role="button" aria-label="Upload shared workbook">
+          <input type="file" id="sharedInput" accept=".xlsx,.xlsm,.xls,.csv">
+          <div class="icon">📋</div>
+          <div class="label">Click or drop the shared file</div>
+          <div class="hint">.xlsx / .xlsm / .xls / .csv</div>
+        </div>
+        <div id="sharedLoaded" class="file-loaded"><div class="dot-ok"></div><span id="sharedName"></span></div>
+      </div>
+    </div>
+    <div id="loadMsg"></div>
+  </section>
+
+  <!-- STEP 2 -->
+  <section class="step disabled" id="step2">
+    <div class="step-header"><div class="badge" id="b2">2</div><h2 class="step-title">Choose sheets and the key column</h2></div>
+    <div class="col-grid">
+      <div><label class="lbl" for="origSheet">Original — sheet</label><select id="origSheet"></select></div>
+      <div><label class="lbl" for="sharedSheet">Shared — sheet</label><select id="sharedSheet"></select></div>
+      <div><label class="lbl" for="origHeader">Original — header row number</label><input type="number" id="origHeader" min="1" value="1"></div>
+      <div><label class="lbl" for="sharedHeader">Shared — header row number</label><input type="number" id="sharedHeader" min="1" value="1"></div>
+      <div><label class="lbl" for="origKey">Original — key column</label><select id="origKey"></select></div>
+      <div><label class="lbl" for="sharedKey">Shared — key column</label><select id="sharedKey"></select></div>
+    </div>
+    <label class="check"><input type="checkbox" id="ignoreCase"> Ignore upper/lower case when matching keys</label>
+    <div class="combine-row">
+      <label class="check"><input type="checkbox" id="combineDup" checked> Combine duplicate IDs in the shared file (join all their values instead of keeping only the last row)</label>
+      <span class="combine-sep" id="combineSepWrap"><label for="combineSep">separator</label><input type="text" id="combineSep" value=" | "></span>
+    </div>
+    <button type="button" class="btn" id="previewBtn">Preview matches →</button>
+    <div id="previewOut">
+      <div class="info-bar" id="matchInfo"></div>
+      <div class="preview-wrap"><table class="prev" id="prevTable"></table></div>
+    </div>
+  </section>
+
+  <!-- STEP 3 -->
+  <section class="step disabled" id="step3">
+    <div class="step-header"><div class="badge" id="b3">3</div><h2 class="step-title">Define column rules</h2></div>
+    <p class="desc">For each rule pick a column from the shared file and the column it should go into in the original.
+      <strong>Replace</strong> overwrites; <strong>Concat</strong> appends after the existing text using the separator.</p>
+    <div class="notice"><span class="ni">ℹ</span><span>
+      <strong>Blank protection:</strong> if the shared cell is empty, the original value is kept.
+      <strong>Excel limit:</strong> text longer than 32,767 characters is trimmed and listed in the summary.</span></div>
+    <div class="table-scroll">
+      <table class="rules-table">
+        <thead><tr><th>Shared column (source)</th><th>Original column (target)</th><th>Operation</th><th></th></tr></thead>
+        <tbody id="rulesBody"></tbody>
+      </table>
+    </div>
+    <div class="btn-row">
+      <button type="button" class="add-btn" id="addRuleBtn">+ Add rule</button>
+      <button type="button" class="add-btn" id="autoMapBtn">⇄ Auto-map same-named columns</button>
+    </div>
+    <div class="btn-row">
+      <button type="button" class="add-btn" id="saveCfgBtn">⬇ Save rules (.json)</button>
+      <button type="button" class="add-btn" id="loadCfgBtn">⬆ Load saved rules</button>
+      <input type="file" id="cfgInput" accept=".json" hidden>
+    </div>
+    <div id="ruleMsg"></div>
+  </section>
+
+  <!-- STEP 4 -->
+  <section class="step disabled" id="step4">
+    <div class="step-header"><div class="badge" id="b4">4</div><h2 class="step-title">Process &amp; download</h2></div>
+    <label class="lbl" for="outName">Output file name</label>
+    <input type="text" id="outName" value="merged.xlsx">
+    <button type="button" class="btn primary" id="processBtn">Process &amp; download</button>
+    <div id="processMsg"></div>
+  </section>
+
+  <footer>Excel Merge Tool · MIT licence · uses SheetJS (Apache-2.0) and JSZip (MIT), bundled for offline use.</footer>
+</div>
+
+<script src="../vendor/xlsx.full.min.js"></script>
+<script src="../vendor/jszip.min.js"></script>
+<script src="merge-core.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

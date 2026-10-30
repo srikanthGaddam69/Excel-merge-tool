@@ -300,34 +300,92 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     return ignoreCase ? s.toUpperCase() : s;
   }
 
+  /*
+   * Performance note: a sheet's stated size ('!ref') often runs to Excel's
+   * last row/column because formatting was applied to whole columns. Looping
+   * over that range took minutes. Instead we scan only the cells that exist
+   * (one pass over the sheet object) and cache the results per worksheet.
+   */
+  var boundsCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+  var tableCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+  var CELL_RE = /^([A-Z]+)(\d+)$/;
+
+  /** Real data extent: { rows: {r: {c: cell}}, maxR, maxC } built from cells that hold a value. */
+  function sheetIndex(XLSX, ws) {
+    if (boundsCache && boundsCache.has(ws)) return boundsCache.get(ws);
+    var idx = { rows: {}, rowList: [], maxR: -1, maxC: -1 };
+    for (var key in ws) {
+      if (key.charCodeAt(0) === 33) continue; /* '!' meta keys */
+      var cell = ws[key];
+      if (!cell || cell.v === undefined || cell.v === null || cell.v === '') continue;
+      var m = CELL_RE.exec(key);
+      if (!m) continue;
+      var c = 0, L = m[1];
+      for (var i = 0; i < L.length; i++) c = c * 26 + (L.charCodeAt(i) - 64);
+      c -= 1;
+      var r = parseInt(m[2], 10) - 1;
+      var row = idx.rows[r];
+      if (!row) { row = idx.rows[r] = {}; idx.rowList.push(r); }
+      row[c] = cell;
+      if (r > idx.maxR) idx.maxR = r;
+      if (c > idx.maxC) idx.maxC = c;
+    }
+    idx.rowList.sort(function (a, b) { return a - b; });
+    if (boundsCache) boundsCache.set(ws, idx);
+    return idx;
+  }
+
+  /** Column titles only (fast; used by the UI drop-downs). */
+  function readHeaders(XLSX, ws, headerRow) {
+    var out = [];
+    if (!ws) return out;
+    var idx = sheetIndex(XLSX, ws);
+    var hr = Math.max(0, (headerRow || 1) - 1);
+    var row = idx.rows[hr] || {};
+    var cols = Object.keys(row).map(Number).sort(function (a, b) { return a - b; });
+    var seen = {};
+    cols.forEach(function (c) {
+      var name = cellText(row[c]).trim();
+      if (!name) return;
+      if (seen[name]) name = name + ' (' + XLSX.utils.encode_col(c) + ')';
+      seen[name] = true;
+      out.push({ name: name, col: c });
+    });
+    return out;
+  }
+
   /**
    * Read a worksheet as a table whose header sits on `headerRow` (1-based).
    * Duplicate / blank headers are made unique with their column letter.
+   * Results are cached per worksheet object and header row; callers must not mutate them.
    */
   function readTable(XLSX, ws, headerRow) {
     var out = { headers: [], rows: [] };
-    if (!ws || !ws['!ref']) return out;
-    var range = XLSX.utils.decode_range(ws['!ref']);
+    if (!ws) return out;
     var hr = Math.max(0, (headerRow || 1) - 1);
-    var seen = {};
-    for (var c = range.s.c; c <= range.e.c; c++) {
-      var hc = ws[XLSX.utils.encode_cell({ r: hr, c: c })];
-      if (!hc || isEmpty(hc.v)) continue;
-      var name = cellText(hc).trim();
-      if (seen[name]) name = name + ' (' + XLSX.utils.encode_col(c) + ')';
-      seen[name] = true;
-      out.headers.push({ name: name, col: c });
-    }
-    for (var r = hr + 1; r <= range.e.r; r++) {
+    var perWs = tableCache ? tableCache.get(ws) : null;
+    if (perWs && perWs[hr]) return perWs[hr];
+
+    var idx = sheetIndex(XLSX, ws);
+    out.headers = readHeaders(XLSX, ws, headerRow);
+    var nH = out.headers.length;
+    for (var k = 0; k < idx.rowList.length; k++) {
+      var r = idx.rowList[k];
+      if (r <= hr) continue;
+      var src = idx.rows[r];
       var cells = {};
       var any = false;
-      for (var i = 0; i < out.headers.length; i++) {
+      for (var i = 0; i < nH; i++) {
         var h = out.headers[i];
-        var cell = ws[XLSX.utils.encode_cell({ r: r, c: h.col })] || null;
+        var cell = src[h.col] || null;
         cells[h.name] = cell;
-        if (cell && !isEmpty(cell.v)) any = true;
+        if (cell) any = true;
       }
       if (any) out.rows.push({ r: r, cells: cells });
+    }
+    if (tableCache) {
+      if (!perWs) { perWs = {}; tableCache.set(ws, perWs); }
+      perWs[hr] = out;
     }
     return out;
   }
@@ -528,6 +586,177 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     return XML_DECL + s;
   }
 
+  /* ---------- fast text-level sheet patch ---------- */
+
+  function escXmlText(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\r/g, '&#13;');
+  }
+  function escXmlAttr(s) {
+    return escXmlText(s).replace(/"/g, '&quot;');
+  }
+  function reEsc(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+  /** Parse attributes of a start tag body into an ordered list [[name, value], ...]. */
+  function parseAttrs(attrText) {
+    var out = [], re = /([^\s=]+)\s*=\s*"([^"]*)"|([^\s=]+)\s*=\s*'([^']*)'/g, m;
+    while ((m = re.exec(attrText))) out.push(m[1] !== undefined ? [m[1], m[2]] : [m[3], m[4]]);
+    return out;
+  }
+  function attrVal(list, name) {
+    for (var i = 0; i < list.length; i++) if (list[i][0] === name) return list[i][1];
+    return null;
+  }
+
+  /**
+   * Patch `updates` into worksheet XML text, touching only the rows that change.
+   * Returns the new XML, or null when the sheet uses a layout this path does not
+   * handle (rows/cells without explicit references, etc.) so the caller falls back
+   * to the full DOM method. Fills `report` the same way as the DOM method.
+   */
+  function fastPatchSheet(xml, updates, report) {
+    var sdOpen = /<((?:[A-Za-z_][\w.-]*:)?)sheetData\b[^>]*?(\/?)>/.exec(xml);
+    if (!sdOpen || sdOpen[2] === '/') return null;
+    var pfx = sdOpen[1];
+    var dataStart = sdOpen.index + sdOpen[0].length;
+    var dataEnd = xml.indexOf('</' + pfx + 'sheetData>', dataStart);
+    if (dataEnd < 0) return null;
+
+    /* Group updates by 1-based row, keeping cells sorted by column */
+    var byRow = {};
+    var rowNums = [];
+    updates.forEach(function (u) {
+      var rn = u.r + 1;
+      if (!byRow[rn]) { byRow[rn] = []; rowNums.push(rn); }
+      byRow[rn].push(u);
+    });
+    if (!rowNums.length) return xml;
+    rowNums.sort(function (a, b) { return a - b; });
+
+    /* Locate every row's span (cheap scan over start tags) */
+    var rowRe = new RegExp('<' + reEsc(pfx) + 'row\\b([^>]*?)(/?)>', 'g');
+    var rowClose = '</' + pfx + 'row>';
+    rowRe.lastIndex = dataStart;
+    var spans = {};          /* rn -> {start, end, attrs, selfClose, open} */
+    var order = [];          /* [rn, start] in document order */
+    var m;
+    while ((m = rowRe.exec(xml)) && m.index < dataEnd) {
+      var rAttr = /(?:^|\s)r\s*=\s*"(\d+)"/.exec(m[1]);
+      if (!rAttr) return null;
+      var rn = parseInt(rAttr[1], 10);
+      var start = m.index, end;
+      if (m[2] === '/') {
+        end = rowRe.lastIndex;
+      } else {
+        var ce = xml.indexOf(rowClose, rowRe.lastIndex);
+        if (ce < 0 || ce > dataEnd) return null;
+        end = ce + rowClose.length;
+      }
+      order.push([rn, start]);
+      if (byRow[rn]) spans[rn] = { start: start, end: end, attrsText: m[1], selfClose: m[2] === '/', openEnd: rowRe.lastIndex };
+      rowRe.lastIndex = end;
+    }
+
+    var cellRe = new RegExp('<' + reEsc(pfx) + 'c\\b([^>]*?)(?:/>|>([\\s\\S]*?)</' + reEsc(pfx) + 'c>)', 'g');
+
+    function cellXml(attrs, u) {
+      var keep = attrs.filter(function (a) { return a[0] !== 't' && a[0] !== 'cm' && a[0] !== 'vm'; });
+      var s = '<' + pfx + 'c' + keep.map(function (a) { return ' ' + a[0] + '="' + escXmlAttr(a[1]) + '"'; }).join('');
+      if (u.type === 'n') return s + '><' + pfx + 'v>' + escXmlText(String(u.value)) + '</' + pfx + 'v></' + pfx + 'c>';
+      return s + ' t="inlineStr"><' + pfx + 'is><' + pfx + 't xml:space="preserve">' + escXmlText(u.value) +
+        '</' + pfx + 't></' + pfx + 'is></' + pfx + 'c>';
+    }
+
+    /* Build the replacement text for one row; returns null to request the DOM fallback */
+    function patchRow(rn, span) {
+      var ups = byRow[rn].slice().sort(function (a, b) { return a.c - b.c; });
+      var rowAttrs = parseAttrs(span ? span.attrsText : '');
+      var rowStyle = attrVal(rowAttrs, 'customFormat') === '1' ? attrVal(rowAttrs, 's') : null;
+      var cells = [];  /* {col, text} */
+      if (span && !span.selfClose) {
+        var inner = xml.slice(span.openEnd, span.end - rowClose.length);
+        cellRe.lastIndex = 0;
+        var cm, pos = 0;
+        var rest = [];
+        while ((cm = cellRe.exec(inner))) {
+          var between = inner.slice(pos, cm.index);
+          if (between.trim()) rest.push(between); /* non-cell content e.g. extLst: keep after cells */
+          var a = parseAttrs(cm[1]);
+          var ref = attrVal(a, 'r');
+          if (!ref) return null;
+          var sp = splitRef(ref);
+          if (!sp || sp.row !== rn) return null;
+          cells.push({ col: sp.col, text: cm[0], attrs: a, body: cm[2] || '' });
+          pos = cellRe.lastIndex;
+        }
+        var tail = inner.slice(pos);
+        if (tail.trim()) rest.push(tail);
+        cells.rest = rest;
+      }
+      var byCol = {};
+      cells.forEach(function (c) { byCol[c.col] = c; });
+      ups.forEach(function (u) {
+        var cn = u.c + 1;
+        var ex = byCol[cn];
+        if (ex) {
+          var fm = new RegExp('<' + reEsc(pfx) + 'f\\b([^>]*?)(/?)>').exec(ex.body);
+          if (fm) {
+            var fa = parseAttrs(fm[1]);
+            if (attrVal(fa, 't') === 'shared' && attrVal(fa, 'ref')) {
+              report.skipped.push({ ref: u.ref, key: u.key, column: u.column, reason: 'cell is the master of a shared formula' });
+              return;
+            }
+            report.formulasReplaced++;
+          }
+          ex.text = cellXml(ex.attrs, u);
+        } else {
+          var na = [['r', numToCol(cn) + rn]];
+          if (rowStyle) na.push(['s', rowStyle]);
+          var nc = { col: cn, text: cellXml(na, u) };
+          byCol[cn] = nc;
+          cells.push(nc);
+        }
+        report.written++;
+      });
+      cells.sort(function (a, b) { return a.col - b.col; });
+      var body = cells.map(function (c) { return c.text; }).join('') + ((cells.rest || []).join(''));
+      var open = '<' + pfx + 'row' + (span ? span.attrsText.replace(/\s+$/, '') : ' r="' + rn + '"') + '>';
+      return open + body + rowClose;
+    }
+
+    /* Assemble: walk existing rows in order, splicing patched/new rows */
+    var out = [];
+    var cursor = 0;
+    var pending = rowNums.filter(function (rn) { return !spans[rn]; }); /* rows to create */
+    var pi = 0;
+    function flushNewBefore(limitRn, at) {
+      while (pi < pending.length && (limitRn === null || pending[pi] < limitRn)) {
+        out.push(xml.slice(cursor, at));
+        cursor = at;
+        var txt = patchRow(pending[pi], null);
+        if (txt === null) return false;
+        out.push(txt);
+        pi++;
+      }
+      return true;
+    }
+    for (var i = 0; i < order.length; i++) {
+      var orn = order[i][0], ostart = order[i][1];
+      if (!flushNewBefore(orn, ostart)) return null;
+      var sp2 = spans[orn];
+      if (sp2) {
+        var t2 = patchRow(orn, sp2);
+        if (t2 === null) return null;
+        out.push(xml.slice(cursor, sp2.start));
+        out.push(t2);
+        cursor = sp2.end;
+        delete spans[orn]; /* a duplicate row number is patched once */
+      }
+    }
+    if (!flushNewBefore(null, dataEnd)) return null;
+    out.push(xml.slice(cursor));
+    return out.join('');
+  }
+
   /**
    * Write `updates` into sheet `sheetName` of the .xlsx/.xlsm in `data`.
    * env = { JSZip, DOMParser, XMLSerializer }
@@ -566,6 +795,12 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       if (!sheetPath || !zip.file(sheetPath)) throw new Error('Worksheet part for "' + sheetName + '" is missing.');
       return zip.file(sheetPath).async('string');
     }).then(function (sheetXml) {
+      /* Fast path: edit only the affected rows as text (big sheets stay quick and light on memory). */
+      var fastXml = env.forceDom ? null : fastPatchSheet(sheetXml, updates, report);
+      if (fastXml !== null) {
+        zip.file(sheetPath, fastXml);
+      } else {
+      report.written = 0; report.formulasReplaced = 0; report.skipped = [];
       sheetDoc = parse(sheetXml);
       var root = sheetDoc.documentElement;
       var ns = root.namespaceURI || MAIN_NS;
@@ -662,6 +897,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       });
 
       zip.file(sheetPath, serialize(Ser, sheetDoc));
+      }
 
       /* Ask Excel to recalculate on open so status formulas pick up new values */
       var wbNs = wbDoc.documentElement.namespaceURI;
@@ -719,6 +955,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     isEmpty: isEmpty,
     cellText: cellText,
     readTable: readTable,
+    readHeaders: readHeaders,
     buildPlan: buildPlan,
     applyToSheetJS: applyToSheetJS,
     patchXlsx: patchXlsx,
@@ -788,7 +1025,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     if (!f) return [];
     var sheet = $(side + 'Sheet').value;
     var hr = parseInt($(side + 'Header').value, 10) || 1;
-    return MergeCore.readTable(XLSX, f.wb.Sheets[sheet], hr).headers.map(function (h) { return h.name; });
+    return MergeCore.readHeaders(XLSX, f.wb.Sheets[sheet], hr).map(function (h) { return h.name; });
   }
 
   function guessKey(names, otherNames) {
@@ -805,10 +1042,16 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   function loadFile(side, file) {
     if (!file) return;
     var reader = new FileReader();
+    msg($('loadMsg'), 'info', '⏳ Reading <strong>' + esc(file.name) + '</strong>… large workbooks can take several seconds.');
     reader.onload = function (e) {
+      setTimeout(function () { parseLoaded(e); }, 30); /* let the "Reading…" message paint first */
+    };
+    function parseLoaded(e) {
       try {
         var buf = new Uint8Array(e.target.result);
-        var wb = XLSX.read(buf, { type: 'array', cellNF: true, cellDates: false });
+        /* Read values and number formats only: formulas, HTML and styles are not needed
+           (the output is patched at XML level), and skipping them makes big files load faster. */
+        var wb = XLSX.read(buf, { type: 'array', cellNF: true, cellDates: false, cellFormula: false, cellHTML: false, cellStyles: false });
         state[side] = { name: file.name, ext: extOf(file.name), buf: buf, wb: wb };
         $(side + 'Name').textContent = file.name + '  ·  ' + wb.SheetNames.length + ' sheet(s)';
         $(side + 'Loaded').style.display = 'flex';
@@ -823,7 +1066,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       } catch (err) {
         msg($('loadMsg'), 'err', 'Could not read <strong>' + esc(file.name) + '</strong>: ' + esc(err.message));
       }
-    };
+    }
     reader.readAsArrayBuffer(file);
   }
 
@@ -1105,7 +1348,14 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     if ($('previewOut').style.display === 'block') buildPreview();
   });
   syncCombine();
-  $('previewBtn').addEventListener('click', buildPreview);
+  $('previewBtn').addEventListener('click', function () {
+    var b = $('previewBtn');
+    b.disabled = true;
+    b.textContent = 'Checking matches…';
+    setTimeout(function () {
+      try { buildPreview(); } finally { b.disabled = false; b.textContent = 'Preview matches →'; }
+    }, 30);
+  });
   $('addRuleBtn').addEventListener('click', function () { addRule(); });
   $('autoMapBtn').addEventListener('click', autoMap);
   $('saveCfgBtn').addEventListener('click', saveConfig);
